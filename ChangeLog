@@ -1,0 +1,34 @@
+2010-08-12 Steve Chu <stvchu@gmail.com>
+* fix a lock bug when creating queue
+
+2009-12-09 Steve Chu <stvchu@gmail.com>
+* version 0.2.0 is released.
+
+2009-12-09 Steve Chu <stvchu@gmail.com>
+* the multiple queue map code is rewritten, now we support instant per-queue statistics. telnet and type 'stats queue' command for detail.
+* tools are added for 'stats queue', check 'tools/'.
+* a new option(-R) is added to remove useless transaction log automatically.
+* some code clearup
+
+2008-11-25 Steve Chu <stvchu@gmail.com>
+* version 0.1.1 is released.
+
+2008-11-25 Steve Chu <stvchu@gmail.com>
+* Bugfix: 'stats queue' did not return right queue name
+* All replication code has been discarded and removed. Original replication
+code is buggy, also nobody want to use replication on a message queue system.
+* more graceful exit
+
+2008-09-19 Steve Chu <stvchu@gmail.com>
+* version 0.1.0 is released.
+
+2008-09-19 Steve Chu <stvchu@gmail.com>
+* All code is rewritten based on latest memcachedb, and multiple queue is supported.
+Please see 'README.html' for usage.
+
+2008-03-17 Steve Chu <stvchu@gmail.com>
+* add a '-A' option to set page size
+
+2008-03-15 Steve Chu <stvchu@gmail.com>
+* version 0.0.1 is released.
+

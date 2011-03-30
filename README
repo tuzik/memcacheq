@@ -1,0 +1,205 @@
+This is a ordered-queue version of memcacheq
+(http://memcachedb.org/memcacheq/) from Tuzik Gaffey.
+
+It's opensourced here meant to be useful for others.
+
+This fork adds the ability to sort the queue with specified order
+(ascending default).
+
+Here's the usage of this fork.
+
+* Server side
+
+ $ memcacheq -u my_user -p 20211  -r -c 1024 -m 64 -N \
+        -H /path/to/my/bdbdata/base
+
+where -u indicates the user who runs this deamon, -p specifies a port
+number that this daemon listens to, -N uses BDB's no-sync feature to
+gain more speed at the cost of consistency, and -H specifies the on-disk
+storage location. See memcacheq's command-line usage for more information.
+
+To start the memcacheq daemon:
+
+If there's corruption in your memcacheq's underlying BDB database, try
+the following command:
+
+  $ /path/to/your/bdb/bin/db_recover -h /path/to/your/bdbdata/base
+
+* Client side
+
+We use pseudo memcache php code to demonstrate the client-side usage.
+
+1. To create a queue:
+
+  $memcache_obj = memcache_connect("localhost", 20211);
+
+
+2. To insert some elements to a queue:
+
+  $memcache_obj->set('foo1#2003', '2003');
+  
+  $memcache_obj->set('foo1#2001', '2001');
+  
+  $memcache_obj->set('foo1#2002', '2002');
+  
+  $memcache_obj->set('foo1#2003', '2005');
+
+where 'foo1#xxxx' is the queue name 'foo1' and order-key 'xxxx' connected 
+with a '#'. the order-key will be used in sort.
+
+Once the queue has already reached the length limit, it returns
+the standard memcached "NOT STORED" exception code.
+
+3. To read an element from a queue:
+
+  while($ret = $memcache_obj->get('foo1')) {
+           var_dump($ret);
+  }
+
+where the queue name is 'foo1'.a typical instance of the output might be:
+
+    string(4) "2001"
+    string(4) "2002"
+    string(4) "2003"
+    string(4) "2005"
+
+it's different with the FIFO output of original memcacheq:
+      
+    string(4) "2003"
+    string(4) "2001"
+    string(4) "2002"
+    string(4) "2005"
+
+Once the queue is already empty, it returns a standard memcached
+"NOT FOUND" exception code.
+
+4. To monitor the queues' state in a certain memcacheq server
+(here we use a shell command to illustrate):
+
+  $ echo stats queue | nc localhost:20211
+
+where the memcacheq daemon listens the 20211 port at localhost. A
+typical instance of the output might be:
+
+    STAT comment 3 1234567
+    STAT done 0 1234567
+    STAT initial 25 1234567
+    STAT pagecat 5006 1234567
+    STAT preprocessed 10 500
+    END
+
+
+
+Below is the original memcacheq documentation in README:
+===============================================
+MemcacheQ - Simple Queue Service over Memcache
+===============================================
+
+Features
+=========
+* damn simple
+* very fast
+* multiple queue
+* concurrent well
+* memcache protocol compatible
+
+Getting Started
+===============
+
+Download
+---------
+See: <http://code.google.com/p/memcacheq/downloads/list>
+
+Installation
+-------------
+See: <http://memcachedb.org/memcacheq/INSTALL.html>
+
+Please take a look at 'ChangLog' file in the distribution, see what's new.
+
+Commands
+---------
+
+Only two commands are used to operate the queue:
+
+**Append a message to the tail of queue**::
+
+   set <queue name> <flags> 0 <message_len>\r\n
+   <put your message body here>\r\n
+   STORED\r\n
+
+**Note:** MQ will create a new queue automatically if your queue is not existed. The original 'expire time' field is ignored by server.
+
+**Consume a message from the head of queue**::
+
+   get <queue name>\r\n
+   VALUE <queue name> <flags> <message_len>\r\n
+   <your message body will come here>\r\n
+   END\r\n
+
+   
+Examples
+---------
+
+Assuming you are using PHP memcache<http://www.php.net/memcache>::
+
+  <?php
+  /* connect to memcached server */
+  $memcache_obj = memcache_connect('memcacheq_host', 21201);
+
+  /* append a message to queue */
+  memcache_set($memcache_obj, 'demoqueue1', 'message body here', 0, 0);
+  
+  /* consume a message from 'demoqueue1' */
+  memcache_get($memcache_obj, 'demoqueue1');
+
+  memcache_close($memcache_obj);
+  ?>
+  
+Limitation
+===========
+The message body is stored in Berkeley DB with fixed length. Any message that is shorter than the declared length will automatically be padded with space character (0x20 in the ASCII character set). 
+
+In Berkeley DB, as the official document refers,
+
+"For the Queue access method, the record length must be enough smaller than the database's page size that at least one record plus the database page's metadata information can fit on each database page."
+
+"The minimum page size is 512 bytes, the maximum page size is 64K bytes, and the page size must be a power-of-two."
+
+So we have a limit on the message body size with a max of a bit less than *64K*.
+
+Other tips
+===========
+use 'stats queue' to see your current queues::
+
+  $ telnet 127.0.0.1 22201
+  Trying 127.0.0.1...
+  Connected to localhost.
+  Escape character is '^]'.
+  stats queue
+  STAT test1 12231/12
+  STAT test2 23/23
+  STAT test3 1212/12
+  STAT test4 1/1
+  END
+  
+delete a queue::
+
+  $ telnet 127.0.0.1 22201
+  Trying 127.0.0.1...
+  Connected to localhost.
+  Escape character is '^]'.
+  delete test1
+  DELETED
+  
+  
+Feedback
+=========
+MemcacheDB mailing list now hosts on Google Group: http://groups.google.com/group/memcachedb
+
+* To subscribe to maillist, send email to memcachedb-subscribe@googlegroups.com
+* To post to maillist, send email to memcachedb@googlegroups.com
+* To unsubscribe from maillist, send email to memcachedb-unsubscribe@googlegroups.com
+
+Please report your bugs and issues to the Maillist.
+
+Last updated by Steve Chu<http://stvchu.org>: 12/09/2009
