@@ -1,4 +1,4 @@
-This is a ordered-queue version of memcacheq
+This is a priority queue version of memcacheq
 (http://memcachedb.org/memcacheq/) from Tuzik Gaffey.
 
 It's opensourced here meant to be useful for others.

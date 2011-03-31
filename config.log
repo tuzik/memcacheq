@@ -122,7 +122,7 @@ configure:3511: $? = 0
 configure:3553: result: (system)
 configure:3585: checking for library containing db_create
 configure:3626: gcc -o conftest -g -O2 -I/usr/local/BerkeleyDB.4.7/include  -L/usr/local/BerkeleyDB.4.7/lib  conftest.c  -levent >&5
-/tmp/ccOb7fSo.o: In function `main':
+/tmp/ccGkAILr.o: In function `main':
 /home/caijingming/code/memcacheq/conftest.c:21: undefined reference to `db_create'
 collect2: ld returned 1 exit status
 configure:3632: $? = 1
@@ -261,7 +261,7 @@ configure:4700: result: none required
 configure:4708: checking for library containing ceilf
 configure:4749: gcc -o conftest -g -O2 -I/usr/local/BerkeleyDB.4.7/include  -L/usr/local/BerkeleyDB.4.7/lib  conftest.c -ldb  -levent >&5
 conftest.c:28: warning: conflicting types for built-in function 'ceilf'
-/tmp/ccgsWuOD.o: In function `main':
+/tmp/ccUPz3Pm.o: In function `main':
 /home/caijingming/code/memcacheq/conftest.c:32: undefined reference to `ceilf'
 collect2: ld returned 1 exit status
 configure:4755: $? = 1

@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *  OmemcacheQ - Simple Ordered Queue Service over Memcache
+ *  PmemcacheQ - Simple Priority Queue Service over Memcache
  *
  *      http://github.com/tuzik/memcacheq
  *
