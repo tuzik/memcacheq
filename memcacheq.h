@@ -1,12 +1,11 @@
-/* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *  MemcacheQ - Simple Queue Service over Memcache
- *
- *      http://memcacheq.googlecode.com
- *
- *  The source code of MemcacheQ is most based on MemcachDB:
+ *  MemcacheDB - A distributed key-value storage system designed for persistent:
  *
  *      http://memcachedb.googlecode.com
+ *
+ *  The source code of Memcachedb is most based on Memcached:
+ *
+ *      http://danga.com/memcached/
  *
  *  Copyright 2008 Steve Chu.  All rights reserved.
  *
@@ -15,9 +14,10 @@
  *
  *  Authors:
  *      Steve Chu <stvchu@gmail.com>
+ *		Tuzik Gaffey <tuzik@love.com>
  *
  */
-
+ 
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
@@ -29,8 +29,6 @@
 #include <event.h>
 #include <netdb.h>
 #include <db.h>
-#include "hashtable.h"
-#include "hash.h"
 
 #define DATA_BUFFER_SIZE 2048
 #define UDP_READ_BUFFER_SIZE 65536
@@ -56,6 +54,16 @@
 #define IOV_LIST_HIGHWAT 600
 #define MSG_LIST_HIGHWAT 100
 
+#define MAX_REP_PRIORITY 1000000
+#define MAX_REP_ACK_POLICY 6
+#define MAX_REP_NSITES 1000
+
+/* Default path for a database, and its env home */
+#define DBFILE "data.db"
+#define DBHOME "/data1/memcacheq"
+
+#define BDB_EID_SELF -3
+
 /* Get a consistent bool type */
 #if HAVE_STDBOOL_H
 # include <stdbool.h>
@@ -79,9 +87,9 @@ struct stats {
     unsigned int  total_conns;
     unsigned int  conn_structs;
     uint64_t      get_cmds;
-    uint64_t      get_hits;
     uint64_t      set_cmds;
-    uint64_t      set_hits;
+    uint64_t      get_hits;
+    uint64_t      get_misses;
     time_t        started;          /* when the process was started */
     uint64_t      bytes_read;
     uint64_t      bytes_written;
@@ -90,6 +98,7 @@ struct stats {
 #define MAX_VERBOSITY_LEVEL 2
 
 struct settings {
+    size_t item_buf_size;
     int maxconns;
     int port;
     int udpport;
@@ -102,6 +111,71 @@ struct settings {
 
 extern struct stats stats;
 extern struct settings settings;
+
+struct bdb_version {
+    int majver;
+    int minver;
+    int patch;
+};
+
+enum mdb_rep_role { MDB_MASTER, MDB_CLIENT, MDB_UNKNOWN };
+
+struct bdb_settings {
+    char *db_file;    /* db filename, where dbfile located. */
+    char *env_home;    /* db env home dir path */
+    u_int32_t cache_size; /* cache size */
+    u_int32_t txn_lg_bsize; /* transaction log buffer size */
+    u_int32_t page_size;    /* underlying database pagesize*/
+    DBTYPE db_type;
+    int txn_nosync;    /* DB_TXN_NOSYNC flag, if 1 will lose transaction's durability for performance */
+    int dldetect_val; /* do deadlock detect every *db_lock_detect_val* millisecond, 0 for disable */
+    int chkpoint_val;  /* do checkpoint every *db_chkpoint_val* second, 0 for disable */
+    int memp_trickle_val;  /* do memp_trickle every *memp_trickle_val* second, 0 for disable */
+    int memp_trickle_percent; /* percent of the pages in the cache that should be clean.*/
+    u_int32_t db_flags; /* database open flags */
+    u_int32_t env_flags; /* env open flags */
+
+    int is_replicated; /* replication is ON?? */
+
+    char *rep_localhost; /* local host in replication */
+    int rep_localport;  /* local port in replication */
+    char *rep_remotehost; /* remote host in replication */
+    int rep_remoteport;  /* remote port in replication */
+
+    int rep_whoami;  /* replication role, MDB_MASTER/MDB_CLIENT/MDB_UNKNOWN */
+    int rep_master_eid; /* replication master's eid */
+
+    u_int32_t rep_start_policy;
+    u_int32_t rep_nsites;
+
+    int rep_ack_policy;
+
+    u_int32_t rep_ack_timeout;
+    u_int32_t rep_chkpoint_delay;
+    u_int32_t rep_conn_retry;
+    u_int32_t rep_elect_timeout;
+    u_int32_t rep_elect_retry;
+    u_int32_t rep_heartbeat_monitor; /* only available on a client */
+    u_int32_t rep_heartbeat_send;    /* only available on a master */
+    u_int32_t rep_lease_timeout;
+
+    int rep_bulk;
+	  int rep_lease;  /* if master lease is enabled? */
+
+    u_int32_t rep_priority;
+
+    u_int32_t rep_req_max;
+    u_int32_t rep_req_min;
+
+    u_int32_t rep_fast_clock;
+    u_int32_t rep_slow_clock;
+
+    u_int32_t rep_limit_gbytes; 
+    u_int32_t rep_limit_bytes; 
+};
+
+extern struct bdb_settings bdb_settings;
+extern struct bdb_version bdb_version;
 
 typedef struct _stritem {
     int             nbytes;     /* size of data */
@@ -129,6 +203,12 @@ enum conn_states {
     conn_closing,    /** closing this connection */
     conn_mwrite,     /** writing out many items sequentially */
 };
+
+#define NREAD_ADD 1
+#define NREAD_SET 2
+#define NREAD_REPLACE 3
+#define NREAD_APPEND 4
+#define NREAD_PREPEND 5
 
 typedef struct conn conn;
 struct conn {
@@ -197,78 +277,43 @@ struct conn {
  * Functions
  */
 
-/* item buffer management */
+/* bdb management */
+void bdb_settings_init(void);
+void bdb_env_init(void);
+void bdb_db_open(void);
+void start_chkpoint_thread(void);
+void start_memp_trickle_thread(void);
+void start_dl_detect_thread(void);
+void bdb_db_close(void);
+void bdb_env_close(void);
+void bdb_chkpoint(void);
+
+/* item management */
 void item_init(void);
 item *do_item_from_freelist(void);
 int do_item_add_to_freelist(item *it);
 item *item_alloc1(char *key, const size_t nkey, const int flags, const int nbytes);
-item *item_alloc2(void);
+item *item_alloc2(size_t ntotal);
 int item_free(item *it);
+item *item_get(char *key, size_t nkey);
+int item_put(char *key, size_t nkey, item *it);
+int item_delete(char *key, size_t nkey);
+int item_exists(char *key, size_t nkey);
+
+/* bdb related stats */
+void stats_bdb(char *temp);
+void stats_rep(char *temp);
+void stats_repmgr(char *temp);
+void stats_repcfg(char *temp);
+void stats_repms(char *temp);
 
 /* conn management */
 conn *do_conn_from_freelist();
 bool do_conn_add_to_freelist(conn *c);
 conn *conn_new(const int sfd, const int init_state, const int event_flags, const int read_buffer_size, const bool is_udp, struct event_base *base);
 
-/* bdb */
-#define DBHOME "/data1/memcacheq"
-
-#define BDB_CLEANUP_DBT() \
-    memset(&dbkey, 0, sizeof(dbkey)); \
-    memset(&dbdata, 0, sizeof(dbdata))
-
-struct bdb_settings {
-    char *env_home;
-    u_int32_t cache_size;
-    u_int32_t txn_lg_bsize;
-    u_int32_t log_auto_remove;
-    u_int32_t page_size;
-    int txn_nosync;
-    int deadlock_detect_val;
-    int checkpoint_val;
-    int mempool_trickle_val;
-    int mempool_trickle_percent;
-    int qstats_dump_val;
-    u_int32_t re_len;
-    u_int32_t q_extentsize;
-};
-
-typedef struct _qstats {
-  int64_t set_hits;
-  int64_t get_hits;
-} qstats_t;
-
-typedef struct _queue {
-  DB* dbp;
-  DBC* dbpc;
-  int64_t set_hits;
-  int64_t get_hits;
-  int64_t old_set_hits;
-  int64_t old_get_hits;
-  pthread_mutex_t lock;
-} queue_t;
-
-extern struct bdb_settings bdb_settings;
-extern DB_ENV *envp;
-
-void  qlist_ht_init(void);
-void  qlist_ht_close(void);
-void  bdb_settings_init(void);
-void  bdb_env_init(void);
-void  bdb_env_close(void);
-void  bdb_qlist_db_open(void);
-void  bdb_qlist_db_close(void);
-int   bdb_create_queue(char *queue_name);
-int   bdb_delete_queue(char *queue_name);
-int   bdb_set(char *key, item *it);
-item* bdb_get(char *key);
-void print_queue_stats(char *temp, int len_limit);
-
-void start_checkpoint_thread(void);
-void start_mempool_trickle_thread(void);
-void start_deadlock_detect_thread(void);
-void start_qstats_dump_thread(void);
-void bdb_chkpoint(void);
+char *do_add_delta(const bool incr, const int64_t delta, char *buf, char *key, size_t nkey);
+int do_store_item(item *item, int comm);
 
 /*
  * In multithreaded mode, we wrap certain functions with lock management and
@@ -290,6 +335,7 @@ int  dispatch_event_add(int thread, conn *c);
 void dispatch_conn_new(int sfd, int init_state, int event_flags, int read_buffer_size, int is_udp);
 
 /* Lock wrappers for cache functions that are called from main loop. */
+char *mt_add_delta(const int incr, const int64_t delta, char *buf, char *key, size_t nkey);
 conn *mt_conn_from_freelist(void);
 bool  mt_conn_add_to_freelist(conn *c);
 int   mt_is_listen_thread(void);
@@ -297,18 +343,22 @@ item *mt_item_from_freelist(void);
 int mt_item_add_to_freelist(item *it);
 void  mt_stats_lock(void);
 void  mt_stats_unlock(void);
+int   mt_store_item(item *item, int comm);
 
+# define add_delta(x,y,z,a,b)        mt_add_delta(x,y,z,a,b)
 # define conn_from_freelist()        mt_conn_from_freelist()
 # define conn_add_to_freelist(x)     mt_conn_add_to_freelist(x)
 # define is_listen_thread()          mt_is_listen_thread()
 # define item_from_freelist()        mt_item_from_freelist()
 # define item_add_to_freelist(x)     mt_item_add_to_freelist(x)
+# define store_item(x,y)             mt_store_item(x,y)
 
 # define STATS_LOCK()                mt_stats_lock()
 # define STATS_UNLOCK()              mt_stats_unlock()
 
 #else /* !USE_THREADS */
 
+# define add_delta(x,y,z,a,b)         do_add_delta(x,y,z,a,b)
 # define conn_from_freelist()         do_conn_from_freelist()
 # define conn_add_to_freelist(x)      do_conn_add_to_freelist(x)
 # define dispatch_conn_new(x,y,z,a,b) conn_new(x,y,z,a,b,main_base)
@@ -316,6 +366,7 @@ void  mt_stats_unlock(void);
 # define is_listen_thread()           1
 # define item_from_freelist()         do_item_from_freelist()
 # define item_add_to_freelist(x)      do_item_add_to_freelist(x)
+# define store_item(x,y)              do_store_item(x,y)
 # define thread_init(x,y)             0
 
 # define STATS_LOCK()                /**/
@@ -323,4 +374,12 @@ void  mt_stats_unlock(void);
 
 #endif /* !USE_THREADS */
 
+
+#define BDB_CLEANUP_DBT() \
+    memset(&dbkey, 0, sizeof(dbkey)); \
+    memset(&dbdata, 0, sizeof(dbdata))
+
+extern DB_ENV *env;
+extern DB *dbp;
+extern DBC *dbcp;
 extern int daemon_quit;

@@ -1,3 +1,9 @@
+2011-04-05 Tuzik Gaffey <tuzik@love.com>
+* Bugfix: queue item delete occurs memory dumps
+
+2011-03-30 Tuzik Gaffey <tuzik@love.com>
+* priority queue fork
+
 2010-08-12 Steve Chu <stvchu@gmail.com>
 * fix a lock bug when creating queue
 

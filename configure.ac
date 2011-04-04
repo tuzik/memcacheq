@@ -1,5 +1,5 @@
 AC_PREREQ(2.61)
-AC_INIT([memcacheq], [0.2.1], [stvchu@gmail.com])
+AC_INIT([memcacheq], [1.2.0], [stvchu@gmail.com])
 AM_INIT_AUTOMAKE([-Wall -Werror foreign])
 AC_PROG_CC
 AM_PROG_CC_C_O
@@ -106,7 +106,6 @@ dnl ----------------------------------------------------------------------------
 AC_SEARCH_LIBS(socket, socket)
 AC_SEARCH_LIBS(gethostbyname, nsl)
 AC_SEARCH_LIBS(mallinfo, malloc)
-AC_SEARCH_LIBS(ceilf, m)
 
 AC_CHECK_FUNC(daemon,AC_DEFINE([HAVE_DAEMON],,[Define this if you have daemon()]),[AC_LIBOBJ(daemon)])
 
@@ -150,5 +149,5 @@ if test "x$enable_threads" == "xyes"; then
   AC_SEARCH_LIBS([pthread_create], [pthread], [AC_DEFINE([USE_THREADS],,[Define this if you want to use pthreads])] ,[AC_MSG_ERROR(cannot find libpthread.so)])
 fi
 
-AC_CONFIG_FILES([Makefile tools/Makefile])
+AC_CONFIG_FILES([Makefile doc/Makefile tools/Makefile conf/Makefile])
 AC_OUTPUT

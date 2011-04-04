@@ -1,12 +1,11 @@
-/* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *  MemcacheQ - Simple Queue Service over Memcache
+ *  MemcacheDB - A distributed key-value storage system designed for persistent:
  *
  *      http://memcacheq.googlecode.com
  *
- *  The source code of MemcacheQ is most based on MemcachDB:
+ *  The source code of Memcachedb is most based on Memcached:
  *
- *      http://memcachedb.googlecode.com
+ *      http://danga.com/memcached/
  *
  *  Copyright 2008 Steve Chu.  All rights reserved.
  *
@@ -17,7 +16,7 @@
  *      Steve Chu <stvchu@gmail.com>
  *
  */
- 
+
 #include "memcacheq.h"
 #include <stdio.h>
 #include <errno.h>
@@ -330,8 +329,7 @@ static void *worker_libevent(void *arg) {
     pthread_cond_signal(&init_cond);
     pthread_mutex_unlock(&init_lock);
 
-    event_base_loop(me->base, 0);
-    return NULL;
+    return (void*) event_base_loop(me->base, 0);
 }
 
 
@@ -401,6 +399,30 @@ void dispatch_conn_new(int sfd, int init_state, int event_flags,
  */
 int mt_is_listen_thread() {
     return pthread_self() == threads[0].thread_id;
+}
+
+/*
+ * Does arithmetic on a numeric item value.
+ */
+char *mt_add_delta(int incr, const int64_t delta, char *buf, char *key, size_t nkey) {
+    char *ret;
+
+    pthread_mutex_lock(&bdb_lock);
+    ret = do_add_delta(incr, delta, buf, key, nkey);
+    pthread_mutex_unlock(&bdb_lock);
+    return ret;
+}
+
+/*
+ * Stores an item in the bdb (high level, obeys set/add/replace semantics)
+ */
+int mt_store_item(item *item, int comm) {
+    int ret;
+
+    pthread_mutex_lock(&bdb_lock);
+    ret = do_store_item(item, comm);
+    pthread_mutex_unlock(&bdb_lock);
+    return ret;
 }
 
 /******************************* GLOBAL STATS ******************************/

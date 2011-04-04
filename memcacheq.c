@@ -1,12 +1,11 @@
-/* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *  MemcacheQ - Simple Queue Service over Memcache
- *
- *      http://memcacheq.googlecode.com
- *
- *  The source code of MemcacheQ is most based on MemcachDB:
+ *  MemcacheDB - A distributed key-value storage system designed for persistent:
  *
  *      http://memcachedb.googlecode.com
+ *
+ *  The source code of Memcachedb is most based on Memcached:
+ *
+ *      http://danga.com/memcached/
  *
  *  Copyright 2008 Steve Chu.  All rights reserved.
  *
@@ -15,6 +14,7 @@
  *
  *  Authors:
  *      Steve Chu <stvchu@gmail.com>
+ *      Tuzik Gaffet <tuzik@love.com>
  *
  */
 
@@ -101,8 +101,13 @@ static void conn_free(conn *c);
 /** exported globals **/
 struct stats stats;
 struct settings settings;
+
 struct bdb_settings bdb_settings;
-DB_ENV *envp = NULL;
+struct bdb_version bdb_version;
+DB_ENV *env;
+DB *dbp;
+DBC *dbcp;
+
 int daemon_quit = 0;
 
 /** file scope variables **/
@@ -116,7 +121,7 @@ static struct event_base *main_base;
 
 static void stats_init(void) {
     stats.curr_conns = stats.total_conns = stats.conn_structs = 0;
-    stats.get_cmds = stats.set_cmds = 0;
+    stats.get_cmds = stats.set_cmds = stats.get_hits = stats.get_misses = 0;
     stats.bytes_read = stats.bytes_written = 0;
 
     /* make the time we started always be 2 seconds before we really
@@ -129,18 +134,18 @@ static void stats_init(void) {
 static void stats_reset(void) {
     STATS_LOCK();
     stats.total_conns = 0;
-    stats.get_cmds = stats.set_cmds = 0;
-    stats.get_hits = stats.set_hits = 0;
+    stats.get_cmds = stats.set_cmds = stats.get_hits = stats.get_misses = 0;
     stats.bytes_read = stats.bytes_written = 0;
     STATS_UNLOCK();
 }
 
 static void settings_init(void) {
     settings.access=0700;
-    settings.port = 22201;
+    settings.port = 21201;
     settings.udpport = 0;
     /* By default this string should be NULL for getaddrinfo() */
     settings.inter = NULL;
+    settings.item_buf_size = 512;     /* default is 512B */
     settings.maxconns = 1024;         /* to limit connections-related memory to about 5MB */
     settings.verbose = 0;
     settings.socketpath = NULL;       /* by default, not using a unix socket */
@@ -639,9 +644,8 @@ static void complete_nread(conn *c) {
     assert(c != NULL);
 
     item *it = c->item;
+    int comm = c->item_comm;
     int ret;
-    char *key = ITEM_key(it);
-    size_t nkey = (size_t)it->nkey;
 
     STATS_LOCK();
     stats.set_cmds++;
@@ -650,19 +654,84 @@ static void complete_nread(conn *c) {
     if (strncmp(ITEM_data(it) + it->nbytes - 2, "\r\n", 2) != 0) {
         out_string(c, "CLIENT_ERROR bad data chunk");
     } else {
-      ret = bdb_set(key, it);
-      if (ret == 0){
-          STATS_LOCK();
-          stats.set_hits++;
-          STATS_UNLOCK();
+      ret = store_item(it, comm);
+      if (ret == 1)
           out_string(c, "STORED");
-      } else {
+      else if(ret == 2)
+          out_string(c, "EXISTS");
+      else if(ret == 3)
+          out_string(c, "NOT_FOUND");
+      else
           out_string(c, "NOT_STORED");
-      }
     }
 
     item_free(c->item);
     c->item = 0;
+}
+
+/*
+ * Stores an item in the cache according to the semantics of one of the set
+ * commands. In threaded mode, this is protected by the cache lock.
+ *
+ * Returns true if the item was stored.
+ */
+int do_store_item(item *it, int comm) {
+    char *key = ITEM_key(it);
+    int ret;
+    item *old_it = NULL;
+    item *new_it = NULL;
+    int stored = 0;
+    int flags;
+
+    if (comm == NREAD_ADD || comm == NREAD_REPLACE) {
+        ret = item_exists(key, strlen(key));
+        if ((ret == 0 && comm == NREAD_REPLACE) ||
+            (ret == 1 && comm == NREAD_ADD) ){
+               return 0;
+        }
+    } else if (comm == NREAD_APPEND || comm == NREAD_PREPEND){
+        /* get orignal item */
+        old_it = item_get(key, strlen(key));
+        if (old_it == NULL){
+            return 0;
+        }
+        
+        /* we have it and old_it here - alloc memory to hold both */
+        /* flags was already lost - so recover them from ITEM_suffix(it) */
+        flags = (int) strtol(ITEM_suffix(old_it), (char **) NULL, 10);        
+        new_it = item_alloc1(key, it->nkey, flags, it->nbytes + old_it->nbytes - 2 /* CRLF */);
+        if (new_it == NULL) {
+            /* SERVER_ERROR out of memory */
+            if (old_it != NULL)
+                item_free(old_it);
+            return 0;
+        }
+        
+        /* copy data from it and old_it to new_it */        
+        if (comm == NREAD_APPEND) {
+            memcpy(ITEM_data(new_it), ITEM_data(old_it), old_it->nbytes);
+            memcpy(ITEM_data(new_it) + old_it->nbytes - 2 /* CRLF */, ITEM_data(it), it->nbytes);
+        } else {
+            /* NREAD_PREPEND */
+            memcpy(ITEM_data(new_it), ITEM_data(it), it->nbytes);
+            memcpy(ITEM_data(new_it) + it->nbytes - 2 /* CRLF */, ITEM_data(old_it), old_it->nbytes);
+        }
+        
+        it = new_it;
+    }
+        
+    ret = item_put(key, strlen(key), it);
+    
+    if (old_it != NULL)
+        item_free(old_it);
+    if (new_it != NULL)
+        item_free(new_it);
+
+    if (ret  == 0) {
+        return 1;
+    } else {
+        return 0;
+    }
 }
 
 typedef struct token_s {
@@ -764,28 +833,29 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
         pid_t pid = getpid();
         char *pos = temp;
 
+#ifndef WIN32
         struct rusage usage;
         getrusage(RUSAGE_SELF, &usage);
+#endif /* !WIN32 */
 
         STATS_LOCK();
         pos += sprintf(pos, "STAT pid %u\r\n", pid);
         pos += sprintf(pos, "STAT uptime %ld\r\n", now - stats.started);
         pos += sprintf(pos, "STAT time %ld\r\n", now);
         pos += sprintf(pos, "STAT version " VERSION "\r\n");
-        pos += sprintf(pos, "STAT pointer_size %lu\r\n", (unsigned long)8 * sizeof(void *));
-        pos += sprintf(pos, "STAT rusage_user %lu.%06lu\r\n", 
-                            (unsigned long)usage.ru_utime.tv_sec, 
-                            (unsigned long)usage.ru_utime.tv_usec);
-        pos += sprintf(pos, "STAT rusage_system %lu.%06lu\r\n", 
-                            (unsigned long)usage.ru_stime.tv_sec, 
-                            (unsigned long)usage.ru_stime.tv_usec);
+        pos += sprintf(pos, "STAT pointer_size %d\r\n", 8 * sizeof(void *));
+#ifndef WIN32
+        pos += sprintf(pos, "STAT rusage_user %ld.%06ld\r\n", usage.ru_utime.tv_sec, usage.ru_utime.tv_usec);
+        pos += sprintf(pos, "STAT rusage_system %ld.%06ld\r\n", usage.ru_stime.tv_sec, usage.ru_stime.tv_usec);
+#endif /* !WIN32 */
+        pos += sprintf(pos, "STAT ibuffer_size %u\r\n", settings.item_buf_size);
         pos += sprintf(pos, "STAT curr_connections %u\r\n", stats.curr_conns - 1); /* ignore listening conn */
         pos += sprintf(pos, "STAT total_connections %u\r\n", stats.total_conns);
         pos += sprintf(pos, "STAT connection_structures %u\r\n", stats.conn_structs);
-        pos += sprintf(pos, "STAT get_cmds %llu\r\n", stats.get_cmds);
+        pos += sprintf(pos, "STAT cmd_get %llu\r\n", stats.get_cmds);
+        pos += sprintf(pos, "STAT cmd_set %llu\r\n", stats.set_cmds);
         pos += sprintf(pos, "STAT get_hits %llu\r\n", stats.get_hits);
-        pos += sprintf(pos, "STAT set_cmds %llu\r\n", stats.set_cmds);
-        pos += sprintf(pos, "STAT set_hits %llu\r\n", stats.set_hits);
+        pos += sprintf(pos, "STAT get_misses %llu\r\n", stats.get_misses);
         pos += sprintf(pos, "STAT bytes_read %llu\r\n", stats.bytes_read);
         pos += sprintf(pos, "STAT bytes_written %llu\r\n", stats.bytes_written);
         pos += sprintf(pos, "STAT threads %u\r\n", settings.num_threads);
@@ -803,12 +873,102 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
         return;
     }
 
-    if (strcmp(subcommand, "queue") == 0) {
-        char temp[2048];
-        print_queue_stats(temp, 2048);
+    /* for bdb stats */
+    if (strcmp(subcommand, "bdb") == 0) {
+        char temp[512];
+        stats_bdb(temp);
         out_string(c, temp);
         return;
     }
+    
+    /* for replication stats */
+    if (bdb_settings.is_replicated){
+        if (strcmp(subcommand, "rep") == 0) {
+            char temp[2048];
+            stats_rep(temp);
+            out_string(c, temp);
+            return;
+        }
+        if (strcmp(subcommand, "repmgr") == 0) {
+            char temp[256];
+            stats_repmgr(temp);
+            out_string(c, temp);
+            return;
+        }
+        if (strcmp(subcommand, "repcfg") == 0) {
+            char temp[512];
+            stats_repcfg(temp);
+            out_string(c, temp);
+            return;
+        }
+        if (strcmp(subcommand, "repms") == 0) {
+            char temp[256];
+            stats_repms(temp);
+            out_string(c, temp);
+            return;
+        }
+    }
+
+#ifdef HAVE_MALLOC_H
+#ifdef HAVE_STRUCT_MALLINFO
+    if (strcmp(subcommand, "malloc") == 0) {
+        char temp[512];
+        struct mallinfo info;
+        char *pos = temp;
+
+        info = mallinfo();
+        pos += sprintf(pos, "STAT arena_size %d\r\n", info.arena);
+        pos += sprintf(pos, "STAT free_chunks %d\r\n", info.ordblks);
+        pos += sprintf(pos, "STAT fastbin_blocks %d\r\n", info.smblks);
+        pos += sprintf(pos, "STAT mmapped_regions %d\r\n", info.hblks);
+        pos += sprintf(pos, "STAT mmapped_space %d\r\n", info.hblkhd);
+        pos += sprintf(pos, "STAT max_total_alloc %d\r\n", info.usmblks);
+        pos += sprintf(pos, "STAT fastbin_space %d\r\n", info.fsmblks);
+        pos += sprintf(pos, "STAT total_alloc %d\r\n", info.uordblks);
+        pos += sprintf(pos, "STAT total_free %d\r\n", info.fordblks);
+        pos += sprintf(pos, "STAT releasable_space %d\r\nEND", info.keepcost);
+        out_string(c, temp);
+        return;
+    }
+#endif /* HAVE_STRUCT_MALLINFO */
+#endif /* HAVE_MALLOC_H */
+
+#if !defined(WIN32) || !defined(__APPLE__)
+    if (strcmp(subcommand, "maps") == 0) {
+        char *wbuf;
+        int wsize = 8192; /* should be enough */
+        int fd;
+        int res;
+
+        if ((wbuf = (char *)malloc(wsize)) == NULL) {
+            out_string(c, "SERVER_ERROR out of memory writing stats maps");
+            return;
+        }
+
+        fd = open("/proc/self/maps", O_RDONLY);
+        if (fd == -1) {
+            out_string(c, "SERVER_ERROR cannot open the maps file");
+            free(wbuf);
+            return;
+        }
+
+        res = read(fd, wbuf, wsize - 6);  /* 6 = END\r\n\0 */
+        if (res == wsize - 6) {
+            out_string(c, "SERVER_ERROR buffer overflow");
+            free(wbuf); close(fd);
+            return;
+        }
+        if (res == 0 || res == -1) {
+            out_string(c, "SERVER_ERROR can't read the maps file");
+            free(wbuf); close(fd);
+            return;
+        }
+        memcpy(wbuf + res, "END\r\n", 5);
+        write_and_free(c, wbuf, res + 5);
+        close(fd);
+        return;
+    }
+#endif
 
     out_string(c, "ERROR");
 }
@@ -822,20 +982,20 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens)
     token_t *key_token = &tokens[KEY_TOKEN];
     int stats_get_cmds   = 0;
     int stats_get_hits   = 0;
+    int stats_get_misses = 0;
     assert(c != NULL);
 
     do {
-    
         while(key_token->length != 0) {
-            
+
             key = key_token->value;
             nkey = key_token->length;
-
 
             if(nkey > KEY_MAX_LENGTH) {
                 STATS_LOCK();
                 stats.get_cmds   += stats_get_cmds;
                 stats.get_hits   += stats_get_hits;
+                stats.get_misses += stats_get_misses;
                 STATS_UNLOCK();
                 out_string(c, "CLIENT_ERROR bad command line format");
                 return;
@@ -843,7 +1003,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens)
 
             stats_get_cmds++;
             
-            it = bdb_get(key);
+            it = item_get(key, nkey);
 
             if (it) {
                 if (i >= c->isize) {
@@ -882,6 +1042,8 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens)
                 *(c->ilist + i) = it;
                 i++;
 
+            } else {
+                stats_get_misses++;
             }
 
             key_token++;
@@ -900,6 +1062,8 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens)
 
     c->icurr = c->ilist;
     c->ileft = i;
+
+	item_cursor_del();
 
     if (settings.verbose > 1)
         fprintf(stderr, ">%d END\n", c->sfd);
@@ -921,12 +1085,13 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens)
     STATS_LOCK();
     stats.get_cmds   += stats_get_cmds;
     stats.get_hits   += stats_get_hits;
+    stats.get_misses += stats_get_misses;
     STATS_UNLOCK();
 
     return;
 }
 
-static void process_update_command(conn *c, token_t *tokens, const size_t ntokens) {
+static void process_update_command(conn *c, token_t *tokens, const size_t ntokens, int comm) {
     char *key;
     size_t nkey;
     int flags;
@@ -966,7 +1131,103 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
     c->item = it;
     c->ritem = ITEM_data(it);
     c->rlbytes = it->nbytes;
+    c->item_comm = comm;
     conn_set_state(c, conn_nread);
+}
+
+static void process_arithmetic_command(conn *c, token_t *tokens, const size_t ntokens, const bool incr) {
+    char temp[sizeof("18446744073709551615")];
+    int64_t delta;
+    char *key;
+    size_t nkey;
+
+    assert(c != NULL);
+
+    if(tokens[KEY_TOKEN].length > KEY_MAX_LENGTH) {
+        out_string(c, "CLIENT_ERROR bad command line format");
+        return;
+    }
+
+    key = tokens[KEY_TOKEN].value;
+    nkey = tokens[KEY_TOKEN].length;
+
+    delta = strtoll(tokens[2].value, NULL, 10);
+
+    if(errno == ERANGE) {
+        out_string(c, "CLIENT_ERROR bad command line format");
+        return;
+    }
+
+    out_string(c, add_delta(incr, delta, temp, key, nkey));
+}
+
+/*
+ * adds a delta value to a numeric item.
+ *
+ * it    item to adjust
+ * incr  true to increment value, false to decrement
+ * delta amount to adjust value by
+ * buf   buffer for response string
+ *
+ * returns a response string to send back to the client.
+ */
+char *do_add_delta(const bool incr, const int64_t delta, char *buf, char *key, size_t nkey) {
+    char *ptr;
+    int64_t value;
+    int vlen, flags, ret;
+    item *old_it = NULL;
+    item *new_it = NULL;
+
+    /* get orignal item */
+    old_it = item_get(key, nkey);
+    if (old_it == NULL){
+        return "NOT_FOUND";
+    }
+
+    /* get orignal digital value */
+    ptr = ITEM_data(old_it);
+    while ((*ptr != '\0') && (*ptr < '0' && *ptr > '9')) ptr++;   // BUG: can't be true
+    /* non-digit will cause strtoull stop :) This is a triky. */
+    value = strtoull(ptr, NULL, 10);
+    if(errno == ERANGE) {
+        return "CLIENT_ERROR cannot increment or decrement non-numeric value";
+    }
+
+    /* cacl new value */
+    if (incr)
+        value += delta;
+    else {
+        if (delta >= value) value = 0;
+        else value -= delta;
+    }
+    vlen = sprintf(buf, "%llu", value);
+
+    /* flags was already lost - so recover them from ITEM_suffix(it) */
+    flags = (int) strtol(ITEM_suffix(old_it), (char **) NULL, 10);
+            
+    /* construct new item */
+    new_it = item_alloc1(key, nkey, flags, vlen + 2);
+    if (new_it == NULL) {
+        /* SERVER_ERROR out of memory */
+        if (old_it != NULL)
+            item_free(old_it);
+        return "SERVER_ERROR out of memory processing arithmetic";
+    }
+    memcpy(ITEM_data(new_it), buf, vlen);
+    memcpy(ITEM_data(new_it) + vlen, "\r\n", 2);
+    
+    /* put new item into storage */
+    ret = item_put(key, nkey, new_it);
+
+    if (old_it != NULL)
+        item_free(old_it);
+    if (old_it != NULL)
+        item_free(new_it);
+
+    if (ret != 0) {
+        return "SERVER_ERROR while put a item";
+    }   
+    return buf;
 }
 
 static void process_delete_command(conn *c, token_t *tokens, const size_t ntokens) {
@@ -980,7 +1241,7 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
         out_string(c, "CLIENT_ERROR bad command line format");
         return;
     }
-    switch (ret = bdb_delete_queue(key)) {
+    switch (ret = item_delete(key, nkey)) {
     case 0:
         out_string(c, "DELETED");
         break;
@@ -1011,14 +1272,58 @@ static void process_verbosity_command(conn *c, token_t *tokens, const size_t nto
     return;
 }
 
+static void process_rep_command(conn *c, token_t *tokens, const size_t ntokens) {
+
+    assert(c != NULL);
+
+    if (bdb_settings.is_replicated){
+        if (ntokens == 3 && strcmp(tokens[COMMAND_TOKEN].value, "rep_set_priority") == 0){
+            int priority;
+            priority = strtoul(tokens[1].value, NULL, 10);
+            if(errno == ERANGE || priority < 0) {
+                out_string(c, "CLIENT_ERROR bad command line format");
+                return;
+            }
+            bdb_settings.rep_priority = priority > MAX_REP_PRIORITY ? MAX_REP_PRIORITY : priority;
+            if (env->rep_set_priority(env, bdb_settings.rep_priority) != 0){
+                out_string(c, "SERVER_ERROR env->rep_set_priority");
+                return;
+            }
+            out_string(c, "OK");
+            return;
+
+        } else if (ntokens == 3 && strcmp(tokens[COMMAND_TOKEN].value, "rep_set_ack_policy") == 0){
+            int ack_policy;
+            ack_policy = strtoul(tokens[1].value, NULL, 10);
+            if(errno == ERANGE || ack_policy <= 0) {
+                out_string(c, "CLIENT_ERROR bad command line format");
+                return;
+            }
+            bdb_settings.rep_ack_policy = ack_policy > MAX_REP_ACK_POLICY ? MAX_REP_ACK_POLICY : ack_policy;
+            if (env->repmgr_set_ack_policy(env, bdb_settings.rep_ack_policy) != 0){
+                out_string(c, "SERVER_ERROR env->repmgr_set_ack_policy");
+                return;
+            }
+            out_string(c, "OK");
+            return;
+
+        }else {
+            out_string(c, "ERROR");
+        }
+    } else {
+        out_string(c, "ERROR");
+    }
+    return;
+}
+
 static void process_bdb_command(conn *c, token_t *tokens, const size_t ntokens) {
 	int ret;
     assert(c != NULL);
 
     if (strcmp(tokens[COMMAND_TOKEN].value, "db_archive") == 0){
-        if(0 != (ret = envp->log_archive(envp, NULL, DB_ARCH_REMOVE))){
+        if(0 != (ret = env->log_archive(env, NULL, DB_ARCH_REMOVE))){
             if (settings.verbose > 1) {
-                fprintf(stderr, "envp->log_archive: %s\n", db_strerror(ret));
+                fprintf(stderr, "env->log_archive: %s\n", db_strerror(ret));
 			}
             out_string(c, "ERROR");
         }else{
@@ -1027,16 +1332,27 @@ static void process_bdb_command(conn *c, token_t *tokens, const size_t ntokens) 
         return;
     
     }else if (strcmp(tokens[COMMAND_TOKEN].value, "db_checkpoint") == 0){
-        if(0 != (ret = envp->txn_checkpoint(envp, 0, 0, 0))){
+        if(0 != (ret = env->txn_checkpoint(env, 0, 0, 0))){
             if (settings.verbose > 1) {
-                fprintf(stderr, "envp->txn_checkpoint: %s\n", db_strerror(ret));
+                fprintf(stderr, "env->txn_checkpoint: %s\n", db_strerror(ret));
 			}
             out_string(c, "ERROR");
         }else{
             out_string(c, "OK");
         }
         return;
-
+    
+    }else if (strcmp(tokens[COMMAND_TOKEN].value, "db_compact") == 0){
+		DB_COMPACT c_data;
+        if(0 != (ret = dbp->compact(dbp, NULL, NULL, NULL, &c_data, DB_FREE_SPACE, NULL))){
+            if (settings.verbose > 1) {
+                fprintf(stderr, "dbp->compact: %s\n", db_strerror(ret));
+			}
+            out_string(c, "ERROR");
+        }else{
+            out_string(c, "OK");
+        }
+        return;
     }else {
         out_string(c, "ERROR");
     }
@@ -1074,17 +1390,34 @@ static void process_command(conn *c, char *command) {
 
         process_get_command(c, tokens, ntokens);
 
-    } else if ((ntokens == 6 ) && (strcmp(tokens[COMMAND_TOKEN].value, "set") == 0) ) {
+    } else if ((ntokens == 6 || ntokens == 7) &&
+               ((strcmp(tokens[COMMAND_TOKEN].value, "add") == 0 && (comm = NREAD_ADD)) ||
+                (strcmp(tokens[COMMAND_TOKEN].value, "set") == 0 && (comm = NREAD_SET)) ||
+                (strcmp(tokens[COMMAND_TOKEN].value, "replace") == 0 && (comm = NREAD_REPLACE)) ||
+                (strcmp(tokens[COMMAND_TOKEN].value, "prepend") == 0 && (comm = NREAD_PREPEND)) ||
+                (strcmp(tokens[COMMAND_TOKEN].value, "append") == 0 && (comm = NREAD_APPEND)) )) {
 
-        process_update_command(c, tokens, ntokens);
-    
+        process_update_command(c, tokens, ntokens, comm);
+
+    } else if (ntokens == 4 && (strcmp(tokens[COMMAND_TOKEN].value, "incr") == 0)) {
+
+        process_arithmetic_command(c, tokens, ntokens, 1);
+
+    } else if (ntokens == 4 && (strcmp(tokens[COMMAND_TOKEN].value, "decr") == 0)) {
+
+        process_arithmetic_command(c, tokens, ntokens, 0);
+
     } else if (ntokens >= 3 && ntokens <= 4 && (strcmp(tokens[COMMAND_TOKEN].value, "delete") == 0)) {
-    
+
         process_delete_command(c, tokens, ntokens);
 
     } else if (ntokens >= 2 && (strcmp(tokens[COMMAND_TOKEN].value, "stats") == 0)) {
 
         process_stat(c, tokens, ntokens);
+
+    } else if (ntokens >= 2 && ntokens <= 3 && (strcmp(tokens[COMMAND_TOKEN].value, "flush_all") == 0)) {
+        out_string(c, "OK");
+        return;
 
     } else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "version") == 0)) {
 
@@ -1098,9 +1431,15 @@ static void process_command(conn *c, char *command) {
 
         process_verbosity_command(c, tokens, ntokens);
 
+    } else if (ntokens == 3 && ((strcmp(tokens[COMMAND_TOKEN].value, "rep_set_ack_policy") == 0) ||
+                                (strcmp(tokens[COMMAND_TOKEN].value, "rep_set_priority") == 0) )) {
+
+        process_rep_command(c, tokens, ntokens);
+
     } else if (ntokens == 2 && 
               ((strcmp(tokens[COMMAND_TOKEN].value, "db_archive") == 0 ) ||
-               (strcmp(tokens[COMMAND_TOKEN].value, "db_checkpoint") == 0 ))) {
+               (strcmp(tokens[COMMAND_TOKEN].value, "db_checkpoint") == 0 ) ||
+               (strcmp(tokens[COMMAND_TOKEN].value, "db_compact") == 0 ))) {
 
         process_bdb_command(c, tokens, ntokens);
 
@@ -1827,7 +2166,7 @@ static int server_socket_unix(const char *path, int access_mask) {
 
 static void usage(void) {
     printf(PACKAGE " " VERSION "\n");
-    printf("-p <num>      TCP port number to listen on (default: 22201)\n"
+    printf("-p <num>      TCP port number to listen on (default: 21201)\n"
            "-U <num>      UDP port number to listen on (default: 0, off)\n"
            "-s <file>     unix socket path to listen on (disables network support)\n"
            "-a <mask>     access mask for unix socket, in octal (default 0700)\n"
@@ -1836,6 +2175,7 @@ static void usage(void) {
            "-r            maximize core file limit\n"
            "-u <username> assume identity of <username> (only when run as root)\n"
            "-c <num>      max simultaneous connections, default is 1024\n"
+           "-b <num>      item size smaller than <num> will use fast memory alloc, default is 512B\n"
            "-v            verbose (print errors/warnings while in event loop)\n"
            "-vv           very verbose (also print client commands/reponses)\n"
            "-h            print this help and exit\n"
@@ -1848,19 +2188,21 @@ static void usage(void) {
     printf("--------------------BerkeleyDB Options-------------------------------\n");
     printf("-m <num>      in-memmory cache size of BerkeleyDB in megabytes, default is 64MB\n");
     printf("-A <num>      underlying page size in bytes, default is 4096, (512B ~ 64KB, power-of-two)\n");
+    printf("-f <file>     filename of database, default is 'data.db'\n");
     printf("-H <dir>      env home of database, default is '/data1/memcacheq'\n");
+    printf("-B <db_type>  type of database, 'btree' or 'hash'. default is 'btree'\n");
     printf("-L <num>      log buffer size in kbytes, default is 32KB\n");
     printf("-C <num>      do checkpoint every <num> seconds, 0 for disable, default is 5 minutes\n");
     printf("-T <num>      do memp_trickle every <num> seconds, 0 for disable, default is 30 seconds\n");
-    printf("-S <num>      do queue stats dump every <num> seconds, 0 for disable, default is 30 seconds\n");
     printf("-e <num>      percent of the pages in the cache that should be clean, default is 60%%\n");
-    /* queue only */
-    printf("-E <num>      how many pages in a single db file, default is 16*1024, 0 for disable\n");
-    printf("-B <num>      specify the message body length in bytes, default is 1024\n");
-    
     printf("-D <num>      do deadlock detecting every <num> millisecond, 0 for disable, default is 100ms\n");
     printf("-N            enable DB_TXN_NOSYNC to gain big performance improved, default is off\n");
-    printf("-R            automatically remove log files that are no longer needed, default is off\n");
+    printf("--------------------Replication Options-------------------------------\n");
+    printf("-R            identifies the host and port used by this site (required).\n");
+    printf("-O            identifies another site participating in this replication group\n");
+    printf("-M/-S         start as a master or slave\n");
+    printf("-n            number of sites that participat in replication, default is 2\n");
+    printf("-----------------------------------------------------------------------\n");
 
     return;
 }
@@ -1883,7 +2225,7 @@ static void usage_license(void) {
     "in the documentation and/or other materials provided with the\n"
     "distribution.\n"
     "\n"
-    "    * Neither the name of the author nor the names of its\n"
+    "    * Neither the name of the Danga Interactive nor the names of its\n"
     "contributors may be used to endorse or promote products derived from\n"
     "this software without specific prior written permission.\n"
     "\n"
@@ -2010,32 +2352,23 @@ static void remove_pidfile(const char *pid_file) {
 /* for safely exit, make sure to do checkpoint*/
 static void sig_handler(const int sig)
 {
-    int ret;
     if (sig != SIGTERM && sig != SIGQUIT && sig != SIGINT) {
         return;
     }
-    if (daemon_quit == 1){
-        return;
-    }
     daemon_quit = 1;
-    fprintf(stderr, "Signal(%d) received, try to exit daemon gracefully..\n", sig);
-
-    /* exit event loop first */
-    fprintf(stderr, "exit event base...");    
-    ret = event_base_loopexit(main_base, 0);
-    if (ret == 0)
-      fprintf(stderr, "done.\n");
-    else
-      fprintf(stderr, "error\n");
+    fprintf(stderr, "Signal %d handled, memcacahedb is now exit..\n", sig);
 
     /* make sure deadlock detect loop is quit*/
     sleep(2);
+
+    /* then we exit to call axexit */
+    exit(EXIT_SUCCESS);
 }
 
 int main (int argc, char **argv) {
     int c;
     struct in_addr addr;
-    bool do_daemonize = false;
+    bool daemonize = false;
     int maxcore = 0;
     char *username = NULL;
     char *pid_file = NULL;
@@ -2063,11 +2396,14 @@ int main (int argc, char **argv) {
     settings_init();
     bdb_settings_init();
 
+    /* get Berkeley DB version*/
+    db_version(&(bdb_version.majver), &(bdb_version.minver), &(bdb_version.patch));
+
     /* set stderr non-buffering (for running under, say, daemontools) */
     setbuf(stderr, NULL);
 
     /* process arguments */
-    while ((c = getopt(argc, argv, "a:U:p:s:c:hivl:dru:P:t:H:m:A:L:C:T:S:e:D:E:B:NR")) != -1) {
+    while ((c = getopt(argc, argv, "a:U:p:s:c:hivl:dru:P:t:b:f:H:B:m:A:L:C:T:e:D:NMSR:O:n:")) != -1) {
         switch (c) {
         case 'a':
             /* access for unix domain socket, as octal mask (like chmod)*/
@@ -2099,7 +2435,7 @@ int main (int argc, char **argv) {
             settings.inter= strdup(optarg);
             break;
         case 'd':
-            do_daemonize = true;
+            daemonize = true;
             break;
         case 'r':
             maxcore = 1;
@@ -2119,9 +2455,31 @@ int main (int argc, char **argv) {
             }
             break;
 #endif
-
+        case 'b':
+            settings.item_buf_size = atoi(optarg);
+            if(settings.item_buf_size < 512){
+                fprintf(stderr, "item buf size must be larger than 512 bytes\n");
+                exit(EXIT_FAILURE);
+            } 
+            if(settings.item_buf_size > 256 * 1024){
+                fprintf(stderr, "Warning: item buffer size(-b) larger than 256KB may cause performance issue\n");
+            } 
+            break;
+        case 'f':
+            bdb_settings.db_file = optarg;
+            break;
         case 'H':
             bdb_settings.env_home = optarg;
+            break;
+        case 'B':
+            if (0 == strcmp(optarg, "btree")){
+                bdb_settings.db_type = DB_BTREE;
+            }else if (0 == strcmp(optarg, "hash")){
+                bdb_settings.db_type = DB_HASH;
+            }else{
+                fprintf(stderr, "Unknown databasetype, only 'btree' or 'hash' is available.\n");
+                exit(EXIT_FAILURE);
+            }
             break;
         case 'm':
             bdb_settings.cache_size = atoi(optarg) * 1024 * 1024;
@@ -2133,36 +2491,60 @@ int main (int argc, char **argv) {
             bdb_settings.txn_lg_bsize = atoi(optarg) * 1024;
             break;
         case 'C':
-            bdb_settings.checkpoint_val = atoi(optarg);
+            bdb_settings.chkpoint_val = atoi(optarg);
             break;
         case 'T':
-            bdb_settings.mempool_trickle_val = atoi(optarg);
-            break;
-        case 'S':
-            bdb_settings.qstats_dump_val = atoi(optarg);
+            bdb_settings.memp_trickle_val = atoi(optarg);
             break;
         case 'e':
-            bdb_settings.mempool_trickle_percent = atoi(optarg);
-            if (bdb_settings.mempool_trickle_percent < 0 || 
-                bdb_settings.mempool_trickle_percent > 100){
-                fprintf(stderr, "mempool_trickle_percent should be 0 ~ 100.\n");
+            bdb_settings.memp_trickle_percent = atoi(optarg);
+            if (bdb_settings.memp_trickle_percent < 0 || 
+                bdb_settings.memp_trickle_percent > 100){
+                fprintf(stderr, "memp_trickle_percent should be 0 ~ 100.\n");
                 exit(EXIT_FAILURE);
             }
             break;
         case 'D':
-            bdb_settings.deadlock_detect_val = atoi(optarg) * 1000;
-            break;
-        case 'E':
-            bdb_settings.q_extentsize = atoi(optarg);
-            break;
-        case 'B':
-            bdb_settings.re_len = atoi(optarg);
+            bdb_settings.dldetect_val = atoi(optarg) * 1000;
             break;
         case 'N':
             bdb_settings.txn_nosync = 1;
             break;
+        case 'M':
+            if (bdb_settings.rep_start_policy == DB_REP_CLIENT){
+                fprintf(stderr, "Can't not be a Master and Slave at same time.\n");
+                exit(EXIT_FAILURE);
+            }else{
+               bdb_settings.rep_start_policy = DB_REP_MASTER;
+            }
+            break;
+       case 'S':
+            if (bdb_settings.rep_start_policy == DB_REP_MASTER){
+                fprintf(stderr, "Can't not be a Master and Slave at same time.\n");
+                exit(EXIT_FAILURE);
+            }else{
+               bdb_settings.rep_start_policy = DB_REP_CLIENT;
+            }
+            break;
         case 'R':
-            bdb_settings.log_auto_remove = 1;
+           bdb_settings.is_replicated = 1;
+           bdb_settings.rep_localhost = strtok(optarg, ":");
+            if ((portstr = strtok(NULL, ":")) == NULL) {
+                fprintf(stderr, "Bad host specification.\n");
+                exit(EXIT_FAILURE);
+            }
+           bdb_settings.rep_localport = (unsigned short)atoi(portstr);
+            break;
+        case 'O':
+            bdb_settings.rep_remotehost = strtok(optarg, ":");
+            if ((portstr = strtok(NULL, ":")) == NULL) {
+                fprintf(stderr, "Bad host specification.\n");
+                exit(EXIT_FAILURE);
+            }
+            bdb_settings.rep_remoteport = (unsigned short)atoi(portstr);
+            break;
+        case 'n':
+            bdb_settings.rep_nsites = atoi(optarg);
             break;
 
         default:
@@ -2217,13 +2599,13 @@ int main (int argc, char **argv) {
         }
     }
 
-    /* do_daemonize if requested */
+    /* daemonize if requested */
     /* if we want to ensure our ability to dump core, don't chdir to / */
-    if (do_daemonize) {
+    if (daemonize) {
         int res;
-        res = daemonize(maxcore, settings.verbose);
+        res = daemon(maxcore, settings.verbose);
         if (res == -1) {
-            fprintf(stderr, "failed to daemon() in order to do_daemonize\n");
+            fprintf(stderr, "failed to daemon() in order to daemonize\n");
             return 1;
         }
     }
@@ -2267,9 +2649,9 @@ int main (int argc, char **argv) {
     thread_init(settings.num_threads, main_base);
     /* save the PID in if we're a daemon, do this after thread_init due to
        a file descriptor handling bug somewhere in libevent */
-    if (do_daemonize)
+    if (daemonize)
         save_pid(getpid(), pid_file);
-    
+
     /* create unix mode sockets after dropping privileges */
     if (settings.socketpath != NULL) {
         if (server_socket_unix(settings.socketpath,settings.access)) {
@@ -2301,29 +2683,33 @@ int main (int argc, char **argv) {
         }
     }
     
+    /* register atexit callback function */
+    if (0 != atexit(bdb_env_close)) {
+        fprintf(stderr, "can not register close_env"); 
+        exit(EXIT_FAILURE);
+    }
+    if (0 != atexit(bdb_db_close)) {
+        fprintf(stderr, "can not register close_db"); 
+        exit(EXIT_FAILURE);
+    }
+    if (0 != atexit(bdb_chkpoint)) {
+        fprintf(stderr, "can not register db_checkpoint"); 
+        exit(EXIT_FAILURE);
+    }
+    
     /* here we init bdb env and open db */
-    qlist_ht_init();
     bdb_env_init();
-    bdb_qlist_db_open();
+    bdb_db_open();
 
     /* start checkpoint and deadlock detect thread */
-    start_checkpoint_thread();
-    start_mempool_trickle_thread();
-    start_deadlock_detect_thread();
-    start_qstats_dump_thread();
-        
+    start_chkpoint_thread();
+    start_memp_trickle_thread();
+    start_dl_detect_thread();
+
     /* enter the event loop */
     event_base_loop(main_base, 0);
-    
-    /* cleanup bdb staff */
-    fprintf(stderr, "try to clean up bdb resource...\n");
-    bdb_chkpoint();
-    bdb_qlist_db_close();
-    bdb_env_close();
-    qlist_ht_close();
-    
     /* remove the PID file if we're a daemon */
-    if (do_daemonize)
+    if (daemonize)
         remove_pidfile(pid_file);
     /* Clean up strdup() call for bind() address */
     if (settings.inter)

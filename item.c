@@ -1,12 +1,11 @@
-/* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *  MemcacheQ - Simple Queue Service over Memcache
+ *  MemcacheDB - A distributed key-value storage system designed for persistent:
  *
  *      http://memcacheq.googlecode.com
  *
- *  The source code of MemcacheQ is most based on MemcachDB:
+ *  The source code of Memcachedb is most based on Memcached:
  *
- *      http://memcachedb.googlecode.com
+ *      http://danga.com/memcached/
  *
  *  Copyright 2008 Steve Chu.  All rights reserved.
  *
@@ -15,9 +14,10 @@
  *
  *  Authors:
  *      Steve Chu <stvchu@gmail.com>
- *
+ *		Tuzik Gaffey <tuzik@love.com>
+ *	
  */
-
+ 
 #include "memcacheq.h"
 #include <stdio.h>
 #include <errno.h>
@@ -61,9 +61,9 @@ item *do_item_from_freelist(void) {
     } else {
         /* If malloc fails, let the logic fall through without spamming
          * STDERR on the server. */
-        s = (item *)malloc( bdb_settings.re_len );
+        s = (item *)malloc( settings.item_buf_size );
         if (s != NULL){
-            memset(s, 0, bdb_settings.re_len);
+            memset(s, 0, settings.item_buf_size);
         }
     }
 
@@ -121,17 +121,24 @@ item *item_alloc1(char *key, const size_t nkey, const int flags, const int nbyte
     item *it;
     char suffix[40];
     size_t ntotal = item_make_header(nkey + 1, flags, nbytes, suffix, &nsuffix);
-    
-    if(ntotal > bdb_settings.re_len){
-        return NULL;
-    }
 
-    it = item_from_freelist();
-    if (it == NULL){
-        return NULL;
-    }
-    if (settings.verbose > 1) {
-        fprintf(stderr, "alloc a item buffer from freelist.\n");
+    if (ntotal > settings.item_buf_size){
+        it = (item *)malloc(ntotal);
+        if (it == NULL){
+            return NULL;
+        }
+        memset(it, 0, ntotal);
+        if (settings.verbose > 1) {
+            fprintf(stderr, "alloc a item buffer from malloc.\n");
+        }
+    }else{
+        it = item_from_freelist();
+        if (it == NULL){
+            return NULL;
+        }
+        if (settings.verbose > 1) {
+            fprintf(stderr, "alloc a item buffer from freelist.\n");
+        }
     }
 
     it->nkey = nkey;
@@ -145,37 +152,177 @@ item *item_alloc1(char *key, const size_t nkey, const int flags, const int nbyte
 /*
  * alloc a item buffer only.
  */
-item *item_alloc2(void) {
+item *item_alloc2(size_t ntotal) {
     item *it;
-
-    it = item_from_freelist();
-    if (it == NULL){
-        return NULL;
-    }
-    if (settings.verbose > 1) {
-        fprintf(stderr, "alloc a item buffer from freelist.\n");
+    if (ntotal > settings.item_buf_size){
+        it = (item *)malloc(ntotal);
+        if (it == NULL){
+            return NULL;
+        }
+        memset(it, 0, ntotal);
+        if (settings.verbose > 1) {
+            fprintf(stderr, "alloc a item buffer from malloc.\n");
+        }
+    }else{
+        it = item_from_freelist();
+        if (it == NULL){
+            return NULL;
+        }
+        if (settings.verbose > 1) {
+            fprintf(stderr, "alloc a item buffer from freelist.\n");
+        }
     }
 
     return it;
 }
 
 /*
- * free a item buffer.
+ * free a item buffer. here 'it' must be a full item.
  */
 
 int item_free(item *it) {
+    size_t ntotal = 0;
     if (NULL == it)
         return 0;
 
-    if (0 != item_add_to_freelist(it)) {
+    /* ntotal may be wrong, if 'it' is not a full item. */
+    ntotal = ITEM_ntotal(it);
+    if (ntotal > settings.item_buf_size){
         if (settings.verbose > 1) {
-            fprintf(stderr, "add a item buffer to freelist fail, use free() directly.\n");
+            fprintf(stderr, "ntotal: %d, use free() directly.\n", ntotal);
         }
         free(it);   
     }else{
-        if (settings.verbose > 1) {
-            fprintf(stderr, "add a item buffer to freelist.\n");
+        if (0 != item_add_to_freelist(it)) {
+            if (settings.verbose > 1) {
+                fprintf(stderr, "ntotal: %d, add a item buffer to freelist fail, use free() directly.\n", ntotal);
+            }
+            free(it);   
+        }else{
+            if (settings.verbose > 1) {
+                fprintf(stderr, "ntotal: %d, add a item buffer to freelist.\n", ntotal);
+            }
         }
+    }
+    return 0;
+}
+
+/* if return item is not NULL, free by caller */
+item *item_get(char *key, size_t nkey){
+    item *it = NULL;
+    DBT dbkey, dbdata;
+    bool stop;
+    int ret;
+    
+    /* first, alloc a fixed size */
+    it = item_alloc2(settings.item_buf_size);
+    if (it == 0) {
+        return NULL;
+    }
+
+
+    BDB_CLEANUP_DBT();
+    dbdata.ulen = settings.item_buf_size;
+    dbdata.data = it;
+    dbdata.flags = DB_DBT_USERMEM;
+
+    stop = false;
+    /* try to get a item from bdb */
+    while (!stop) {
+		ret = dbcp->get(dbcp, &dbkey, &dbdata, DB_NEXT);
+		if(ret == 0)
+			ret = dbcp->get(dbcp, &dbkey, &dbdata, DB_PREV);
+
+		switch(ret) {
+		case 0:
+			stop = true;
+			break;
+		case DB_NOTFOUND:
+			stop = true;
+			item_free(it);
+			it = NULL;
+			fprintf(stderr, "dbcp->get :%s\n", db_strerror(ret));
+			break;
+		default:
+			stop = true;
+            item_free(it);
+            it = NULL;
+			if (settings.verbose > 1) {
+	                fprintf(stderr, "dbcp->get: %s\n", db_strerror(ret));
+		    }
+    	}
+	}
+    return it;
+}
+
+/* 0 for Success
+   -1 for SERVER_ERROR
+*/
+int item_put(char *key, size_t nkey, item *it){
+    int ret;
+    DBT dbkey, dbdata;
+
+    BDB_CLEANUP_DBT();
+    dbkey.data = key;
+    dbkey.size = nkey;
+    dbdata.data = it;
+    dbdata.size = ITEM_ntotal(it);
+    ret = dbcp->put(dbcp, &dbkey, &dbdata, DB_NODUPDATA);
+    if (ret == 0) {
+        return 0;
+    } else {
+        if (settings.verbose > 1) {
+            fprintf(stderr, "dbcp->put: %s\n", db_strerror(ret));
+        }
+        return -1;
+    }
+}
+
+/* 0 for Success
+   1 for NOT_FOUND
+   -1 for SERVER_ERROR
+*/
+int item_delete(char *key, size_t nkey){
+    int ret;
+    DBT dbkey;
+    
+    memset(&dbkey, 0, sizeof(dbkey));
+    dbkey.data = key;
+    dbkey.size = nkey;
+    ret = dbp->del(dbp, NULL, &dbkey, 0);
+    if (ret == 0){
+        return 0;
+    }else if(ret == DB_NOTFOUND){
+        return 1;
+    }else{
+        if (settings.verbose > 1) {
+            fprintf(stderr, "dbp->del: %s\n", db_strerror(ret));
+        }
+        return -1;
+    }
+}
+
+int item_cursor_del(){
+	int ret;
+	ret = dbcp->del(dbcp,0);
+	fprintf(stderr,"dbcp->del ret is :%d\n",ret);
+	return ret;
+}
+
+/*
+1 for exists
+0 for non-exist
+*/
+int item_exists(char *key, size_t nkey){
+    int ret;
+    DBT dbkey;
+    
+    memset(&dbkey, 0, sizeof(dbkey));
+    dbkey.data = key;
+    dbkey.size = nkey;
+    ret = dbp->exists(dbp, NULL, &dbkey, 0);
+    if (ret == 0){
+        return 1;
     }
     return 0;
 }
