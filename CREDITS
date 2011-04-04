@@ -13,3 +13,5 @@ on Memcached 1.1.x.
 version.
 
 * Caokai<caokai@staff.sina.com.cn> contributed some code of replication.
+
+* Tuzik Gaffey<tuzik@love.com> contributed priority queue.
