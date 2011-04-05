@@ -230,7 +230,7 @@ item *item_get(char *key, size_t nkey){
     /* try to get a item from bdb */
     while (!stop) {
 		ret = dbcp->get(dbcp, &dbkey, &dbdata, DB_NEXT);
-		if(ret == 0)
+		if(ret == DB_NOTFOUND)
 			ret = dbcp->get(dbcp, &dbkey, &dbdata, DB_PREV);
 
 		switch(ret) {
